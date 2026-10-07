@@ -1,0 +1,223 @@
+# Release: installers for macOS and Windows attached to a DRAFT GitHub release.
+#
+#   - Push a tag vX.Y.Z: the tag is checked against the app version, CI runs on the tagged
+#     commit, the bundles are built, and a draft release for the tag is created (or, if a
+#     draft for it exists, refreshed). Read the notes, try the bundles and publish the draft
+#     by hand. Nothing here publishes, and a published release is never touched.
+#   - Run it by hand (workflow_dispatch): a dry run. It builds the bundles and keeps them
+#     as workflow artifacts only; no release is created, read or changed.
+#
+# The bundles are not signed with a certificate. The macOS app gets an ad-hoc signature
+# (bundle.macOS.signingIdentity "-" in tauri.conf.json), which keeps the bundle intact;
+# macOS Gatekeeper and Windows SmartScreen will still warn on first launch.
+
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two runs for one tag queue behind each other rather than racing on the release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fails fast, before anything is built: the tag has to be the app version, and a tag
+  # run has to be on a commit that is on main.
+  version:
+    name: Tag and version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Tag equals the version
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          npm_version=$(node -p "require('./package.json').version")
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$npm_version" != "$cargo_version" ]; then
+            echo "::error::package.json is $npm_version but src-tauri/Cargo.toml is $cargo_version."
+            exit 1
+          fi
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "Dry run on $REF_NAME: version $npm_version, no tag to compare."
+            exit 0
+          fi
+          if [ "$REF_NAME" != "v$npm_version" ]; then
+            echo "::error::The tag is $REF_NAME but the app is version $npm_version: the tag has to be v$npm_version."
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" FETCH_HEAD; then
+            echo "::error::$REF_NAME is not on main: a release is cut from a commit on main."
+            exit 1
+          fi
+          echo "$REF_NAME is version $npm_version, on main."
+
+  ci:
+    name: CI on the tagged commit
+    needs: version
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+    with:
+      skip-bundles: true
+
+  bundle:
+    name: Bundle (${{ matrix.name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One universal binary (Apple Silicon and Intel in a single .dmg)
+          - name: macOS
+            os: macos-14
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri-args: --target universal-apple-darwin
+            bundle-dir: src-tauri/target/universal-apple-darwin/release/bundle
+            expect: dmg
+          - name: Windows
+            os: windows-latest
+            rust-targets: ''
+            tauri-args: ''
+            bundle-dir: src-tauri/target/release/bundle
+            expect: msi exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+      # Runs `npm run build` itself (beforeBuildCommand)
+      - name: tauri build
+        run: npx tauri build ${{ matrix.tauri-args }}
+
+      # Without the ad-hoc signature covering the whole bundle, a downloaded app is
+      # "damaged" to Gatekeeper with no way to open it. A broken signature fails here.
+      - name: macOS app signature is intact
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ matrix.bundle-dir }}
+        run: |
+          app="$BUNDLE_DIR/macos/NC-Code Viewer.app"
+          codesign -dv "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - name: Every expected bundle type is there
+        shell: bash
+        env:
+          BUNDLE_DIR: ${{ matrix.bundle-dir }}
+          EXPECT: ${{ matrix.expect }}
+        run: |
+          find "$BUNDLE_DIR" -type f \( -name '*.dmg' -o -name '*.msi' -o -name '*.exe' \) -exec ls -l {} +
+          for ext in $EXPECT; do
+            if ! ls "$BUNDLE_DIR"/*/*."$ext" > /dev/null 2>&1; then
+              echo "::error::No .$ext bundle under $BUNDLE_DIR."
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ncview-release-${{ matrix.os }}
+          path: |
+            ${{ matrix.bundle-dir }}/dmg/*.dmg
+            ${{ matrix.bundle-dir }}/msi/*.msi
+            ${{ matrix.bundle-dir }}/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  # The only job that can write, and only for a tag push. It creates the draft release
+  # (or refreshes a draft that is already there), attaches the bundles and a SHA256SUMS
+  # file, and stops. It never publishes, and it fails on a published release.
+  draft:
+    name: Draft release
+    needs: [version, ci, bundle]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: ncview-release-*
+          merge-multiple: true
+          path: bundles
+
+      - name: Bundles and checksums
+        shell: bash
+        run: |
+          mkdir assets
+          find bundles -type f -exec cp {} assets/ \;
+          if [ "$(ls assets | wc -l)" -ne "$(find bundles -type f | wc -l)" ]; then
+            echo "::error::Two bundles have the same file name."
+            exit 1
+          fi
+          (cd assets && sha256sum -- * > ../SHA256SUMS && mv ../SHA256SUMS .)
+          ls -l assets
+          cat assets/SHA256SUMS
+
+      - name: Create or refresh the draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          # `releases/tags/<tag>` does not return a draft, so look in the list
+          states=$(gh api --paginate "repos/$REPO/releases" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | \"\(.id) \(.draft)\"")
+          n=$(printf '%s' "$states" | grep -c . || true)
+
+          if [ "$n" -eq 0 ]; then
+            echo "No release for $TAG yet: creating the draft."
+            gh release create "$TAG" --repo "$REPO" --draft --verify-tag \
+              --title "NC-Code Viewer $TAG" --generate-notes assets/*
+          elif [ "$n" -gt 1 ]; then
+            echo "::error::More than one release is tagged $TAG; not touching any of them."
+            exit 1
+          else
+            id=${states% *}
+            draft=${states#* }
+            if [ "$draft" != "true" ]; then
+              echo "::error::$TAG is already published. A published release is never overwritten; fix forward with a new version."
+              exit 1
+            fi
+            echo "A draft for $TAG exists (id $id): refreshing its files."
+            for asset in $(gh api --paginate "repos/$REPO/releases/$id/assets" --jq '.[].id'); do
+              gh api --method DELETE "repos/$REPO/releases/assets/$asset"
+            done
+            gh release upload "$TAG" --repo "$REPO" assets/*
+          fi
