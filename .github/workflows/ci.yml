@@ -1,0 +1,135 @@
+# Continuous integration: type check, unit tests and frontend build; Rust checks and
+# unsigned debug bundles on macOS and Windows. The release workflow (release.yml) calls
+# this one on a version tag, without the debug bundles.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The release workflow runs the whole of this workflow on the tagged commit. It builds
+  # the release bundles itself, so it asks for the debug bundles to be left out.
+  workflow_call:
+    inputs:
+      skip-bundles:
+        description: Leave out the debug bundle jobs
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - name: Type check (svelte-check)
+        run: npm run check
+      - name: Unit tests (vitest)
+        run: npm test
+      - name: Build frontend
+        run: npm run build
+      - name: Versions match
+        shell: bash
+        run: |
+          npm_version=$(node -p "require('./package.json').version")
+          cargo_version=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -1)
+          if [ "$npm_version" != "$cargo_version" ]; then
+            echo "::error::package.json is $npm_version but src-tauri/Cargo.toml is $cargo_version."
+            exit 1
+          fi
+          echo "Version $npm_version"
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # generate_context! embeds the frontend, so build/ must exist before cargo runs
+      - run: npm ci
+      - run: npm run build
+
+      - name: cargo fmt
+        working-directory: src-tauri
+        run: cargo fmt --check
+      - name: cargo clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: cargo test
+        working-directory: src-tauri
+        run: cargo test --locked
+
+  bundle:
+    name: Debug bundle (${{ matrix.os }})
+    needs: checks
+    if: ${{ !inputs.skip-bundles }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - run: npm ci
+      # Runs `npm run build` itself (beforeBuildCommand); unsigned debug bundles
+      - name: tauri build --debug
+        run: npx tauri build --debug
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ncview-debug-${{ matrix.os }}
+          path: |
+            src-tauri/target/debug/bundle/dmg/*.dmg
+            src-tauri/target/debug/bundle/msi/*.msi
+            src-tauri/target/debug/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

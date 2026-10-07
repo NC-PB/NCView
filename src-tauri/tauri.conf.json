@@ -1,7 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "ncview",
-  "version": "0.1.0",
+  "productName": "NC-Code Viewer",
+  "mainBinaryName": "ncview",
+  "version": "../package.json",
   "identifier": "com.cnc-master.ncview",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -20,7 +21,18 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data:"
+      },
+      "devCsp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost ws://localhost:1420 ws://localhost:1421",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data:"
+      }
     }
   },
   "bundle": {
@@ -32,6 +44,9 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {
+      "signingIdentity": "-"
+    }
   }
 }
