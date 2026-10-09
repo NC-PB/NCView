@@ -2,6 +2,22 @@
 
 A fast, distraction-free G-code / NC-code viewer for NC programmers, built with Tauri and Svelte. Open a program, read it, close it — nothing else in the way.
 
+## Download
+
+Get the latest version from the **[Releases page](https://github.com/NC-PB/NCView/releases/latest)**:
+
+| System | File |
+| --- | --- |
+| macOS (Apple Silicon and Intel) | `NC-Code Viewer_<version>_universal.dmg` |
+| Windows | `NC-Code Viewer_<version>_x64-setup.exe` or `NC-Code Viewer_<version>_x64_en-US.msi` |
+
+`SHA256SUMS` lists the checksum of every file.
+
+The installers are not signed with a paid certificate, so the system warns on first launch:
+
+- **macOS**: open the `.dmg` and drag the app to *Applications*. On first launch macOS says the app is from an unidentified developer; right-click the app and choose **Open**, or go to *System Settings → Privacy & Security* and click **Open Anyway**. You only need to do this once.
+- **Windows**: when SmartScreen shows *Windows protected your PC*, click **More info → Run anyway**.
+
 ## Features
 
 - **Fast opening**: Drop a file onto the window, press `⌘O` / `Ctrl+O`, or use the Open button
